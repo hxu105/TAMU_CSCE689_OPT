@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
@@ -47,7 +48,7 @@ torchvision_model_names = sorted(name for name in torchvision_models.__dict__
 model_names = torchvision_model_names
 
 parser = argparse.ArgumentParser(description='SogCLR Pre-Training')
-parser.add_argument('--data', metavar='DIR', default='./data/',
+parser.add_argument('--data', metavar='DIR', default='/data/xht/data/',
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
@@ -111,13 +112,16 @@ parser.add_argument('--save_dir', default='./saved_models/', type=str)
 
 # sogclr
 parser.add_argument('--loss_type', default='dcl', type=str,
-                    choices=['dcl', 'cl'],
+                    choices=['dcl', 'cl', 'moco_cl'],
                     help='learing rate scaling (default: linear)')
 parser.add_argument('--gamma', default=0.9, type=float,
                     help='for updating u')
 parser.add_argument('--learning-rate-scaling', default='linear', type=str,
                     choices=['sqrt', 'linear'],
                     help='learing rate scaling (default: linear)')
+
+# distributed
+parser.add_argument('--local_rank', default=0, type=int)
 
 
 def main():
@@ -152,6 +156,10 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         data_size = 1000000 
     print ('pretraining on %s'%args.data_name)
+    # global_rank = int(os.environ['SLURM_PROCID'])
+    # loca_rank = os.environ['LOCAL_RANK']
+    # world_size = int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(backend='nccl')
 
     # create model
     print("=> creating model '{}'".format(args.arch))
@@ -173,6 +181,7 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        # torch.nn.parallel.DistributedDataParallel(model,device_ids=[args.local_rank])
 
     # optimizers
     if args.optimizer == 'lars':
@@ -188,7 +197,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # log_dir 
     save_root_path = args.save_dir
     global_batch_size = args.batch_size
-    method_name = {'dcl': 'sogclr', 'cl': 'simclr'}[args.loss_type]
+    method_name = {'dcl': 'sogclr', 'cl': 'simclr', 'moco_cl':'moco_sog'}[args.loss_type]
     logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer )
     summary_writer = SummaryWriter(log_dir=os.path.join(save_root_path, logdir))
     print (logdir)
@@ -300,11 +309,15 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+        # print(images[0].shape)
+        # print(images[1].shape)
 
         # compute output
         with torch.cuda.amp.autocast(True):
+            # logits = model.moco_contrast(images[0], images[1])
             loss = model(images[0], images[1], index, args.gamma)
         ##change loss
+        # exit()
 
         losses.update(loss.item(), images[0].size(0))
 
