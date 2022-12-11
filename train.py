@@ -30,15 +30,31 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda import amp
 
 import sogclr.builder
 import sogclr.loader
 import sogclr.optimizer
 import sogclr.cifar  # cifar
 
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data.distributed import DistributedSampler
+
 # ignore all warnings
 import warnings
 warnings.filterwarnings("ignore")
+
+class AddGaussianNoise(object):
+    def __init__(self, mean=0., std=1.):
+        self.std = std
+        self.mean = mean
+        
+    def __call__(self, tensor):
+        return tensor + torch.randn(tensor.size()) * self.std + self.mean
+    
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 
 torchvision_model_names = sorted(name for name in torchvision_models.__dict__
@@ -77,7 +93,7 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--seed', default=None, type=int,
+parser.add_argument('--seed', default=42, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=0, type=int,
                     help='GPU id to use.')
@@ -123,6 +139,31 @@ parser.add_argument('--learning-rate-scaling', default='linear', type=str,
 # distributed
 parser.add_argument('--local_rank', default=0, type=int)
 
+# SWA
+parser.add_argument('--swa', action='store_true', default=False, help='Self-ensemble learning')
+
+# SAM
+parser.add_argument('--norm_type', type=str, default='l2')
+parser.add_argument('--adv_steps', type=int, default=2)
+parser.add_argument(
+        '--adv_init_mag',
+        type=float,
+        default=0.1,
+        help=""
+    )
+parser.add_argument(
+        '--adv_max_norm',
+        type=float,
+        default=3,
+        help="set to 0 to be unlimited"
+    )
+parser.add_argument(
+        '--eps',
+        type=float,
+        default=1e-5,
+        help="set to 0 to be unlimited"
+    )
+
 
 def main():
     args = parser.parse_args()
@@ -159,7 +200,11 @@ def main_worker(gpu, ngpus_per_node, args):
     # global_rank = int(os.environ['SLURM_PROCID'])
     # loca_rank = os.environ['LOCAL_RANK']
     # world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group(backend='nccl')
+    dist.init_process_group(backend='nccl', world_size=int(os.environ["WORLD_SIZE"]))
+
+    local_rank = torch.distributed.get_rank()
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
 
     # create model
     print("=> creating model '{}'".format(args.arch))
@@ -180,8 +225,13 @@ def main_worker(gpu, ngpus_per_node, args):
         print('using CPU, this will be slow')
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
+        model = model.to(f'cuda:{local_rank}')
         # torch.nn.parallel.DistributedDataParallel(model,device_ids=[args.local_rank])
+        if torch.cuda.device_count() > 1:
+            print("Let's use", torch.cuda.device_count(), "GPUs!")
+            model = torch.nn.parallel.DistributedDataParallel(model,
+                                                            device_ids=[local_rank],
+                                                            output_device=local_rank)
 
     # optimizers
     if args.optimizer == 'lars':
@@ -192,13 +242,13 @@ def main_worker(gpu, ngpus_per_node, args):
         optimizer = torch.optim.AdamW(model.parameters(), args.lr,
                                 weight_decay=args.weight_decay)
         
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = amp.GradScaler()
    
     # log_dir 
     save_root_path = args.save_dir
     global_batch_size = args.batch_size
     method_name = {'dcl': 'sogclr', 'cl': 'simclr', 'moco_cl':'moco_sog'}[args.loss_type]
-    logdir = '20221013_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer )
+    logdir = 'basline_%s_%s_%s-%s-%s_bz_%s_E%s_WR%s_lr_%.3f_%s_wd_%s_t_%s_g_%s_%s'%(args.data_name, args.arch, method_name, args.dim, args.mlp_dim, global_batch_size, args.epochs, args.warmup_epochs, args.lr, args.learning_rate_scaling, args.weight_decay, args.t, args.gamma, args.optimizer )
     summary_writer = SummaryWriter(log_dir=os.path.join(save_root_path, logdir))
     print (logdir)
     
@@ -244,7 +294,8 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.RandomGrayscale(p=0.2),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        normalize
+        normalize,
+        # AddGaussianNoise(0, 2/255)
     ]
     
     if args.data_name == 'cifar10':
@@ -261,28 +312,48 @@ def main_worker(gpu, ngpus_per_node, args):
         raise ValueError
 
  
-    train_sampler = None
+    train_sampler = DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last=True)
 
+    if args.swa:
+        swa_model = AveragedModel(model)
+        scheduler = CosineAnnealingLR(optimizer, T_max=100)
+        swa_start = 300
+        swa_scheduler = SWALR(optimizer, swa_lr=0.05)
+    else:
+        swa_model = None
+        scheduler = None
+        swa_scheduler = None
+    
+    # train_loss = float('inf')
     for epoch in range(args.start_epoch, args.epochs):
 
         # train for one epoch
-        train(train_loader, model, optimizer, scaler, summary_writer, epoch, args)
+        loss = train(train_loader, model, optimizer, scaler, summary_writer, epoch, args, local_rank, scheduler, swa_model, swa_scheduler)
         if epoch % 10 == 0 or args.epochs - epoch < 3:
-           save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-            }, is_best=False, filename=os.path.join(save_root_path, logdir, 'checkpoint_%04d.pth.tar' % epoch) )
-        
+            if torch.cuda.device_count() > 1:
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.module.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                }, is_best=False, filename=os.path.join(save_root_path, logdir, 'checkpoint_%04d.pth.tar' % epoch))
+            else:
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
+                }, is_best=False, filename=os.path.join(save_root_path, logdir, 'checkpoint_%04d.pth.tar' % epoch))
+                # train_loss = loss
     summary_writer.close()
     
 
-def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
+def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args, local_rank=None, scheduler=None, swa_model=None, swa_scheduler=None):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     learning_rates = AverageMeter('LR', ':.4e')
@@ -298,6 +369,12 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     end = time.time()
     iters_per_epoch = len(train_loader)
 
+    noise_sampler = torch.distributions.uniform.Uniform(
+                low=-args.eps, high=args.eps
+            )
+
+    average_loss = 0.0
+
     for i, (images, _, index) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -307,18 +384,52 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         learning_rates.update(lr)
 
         if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            # images[0] = images[0].to(device)
+            # images[1] = images[1].to(device)
+            # images[0] = images[0].cuda(args.gpu, non_blocking=True)
+            # images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            images[0] = images[0].cuda(local_rank, non_blocking=True)
+            images[1] = images[1].cuda(local_rank, non_blocking=True)
         # print(images[0].shape)
         # print(images[1].shape)
+        
+        #############################################################################################
+        # if isinstance(model, torch.nn.DataParallel):
+        #     weights0 = model.module.base_encoder.fc[0].weight.data.detach().clone()
+        #     weights1 = model.module.base_encoder.fc[1].weight.data.detach().clone()
+        # else:
+        #     weights0 = model.base_encoder.fc[0].weight.detach().clone()
+        #     weights1 = model.base_encoder.fc[1].weight.detach().clone()
+        # noise0 = noise_sampler.sample(sample_shape=weights0.shape).to(
+        #                     weights0
+        #                     )
+        # noise1 = noise_sampler.sample(sample_shape=weights1.shape).to(
+        #                     weights0
+        #                     )
+        # if isinstance(model, torch.nn.DataParallel):
+        #     model.module.base_encoder.fc[0].weight.data.add(noise0)
+        #     model.module.base_encoder.fc[1].weight.data.add(noise1)
+        # else:
+        #     model.base_encoder.fc[0].weight.data.add(noise0)
+        #     model.base_encoder.fc[1].weight.data.add(noise1)
+        # with torch.cuda.amp.autocast(True):
+        #     # logits = model.moco_contrast(images[0], images[1])
+        #     loss = model(images[0], images[1], index, args.gamma, local_rank=local_rank)
+        # if isinstance(model, torch.nn.DataParallel):
+        #     model.module.base_encoder.fc[0].weight.data = weights0
+        #     model.module.base_encoder.fc[1].weight.data = weights1
+        # else:
+        #     model.base_encoder.fc[0].weight.data = weights0
+        #     model.base_encoder.fc[1].weight.data = weights1
+        #############################################################################################
 
         # compute output
         with torch.cuda.amp.autocast(True):
             # logits = model.moco_contrast(images[0], images[1])
-            loss = model(images[0], images[1], index, args.gamma)
+            loss = model(images[0], images[1], index, args.gamma, local_rank=local_rank)
         ##change loss
         # exit()
-
+        average_loss += loss.item() / len(train_loader)
         losses.update(loss.item(), images[0].size(0))
 
         summary_writer.add_scalar("loss", loss.item(), epoch * iters_per_epoch + i)
@@ -328,6 +439,12 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:
+            if epoch > swa_start:
+                swa_model.update_parameters(model)
+                swa_scheduler.step()
+            else:
+                scheduler.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -335,6 +452,7 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return average_loss
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
