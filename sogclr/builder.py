@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda import amp
 
 
 class SimCLR(nn.Module):
@@ -15,7 +16,7 @@ class SimCLR(nn.Module):
    
     """
     def __init__(self, base_encoder, dim=256, mlp_dim=2048, T=1.0, cifar_head=False, 
-    loss_type='dcl', N=50000, num_proj_layers=2, K=65536, m=0.999, device=None):
+    loss_type='dcl', N=50000, num_proj_layers=2, K=65536, m=0.999, radius=0.6, device=None):
         """
         dim: feature dimension (default: 256)
         mlp_dim: hidden dimension in MLPs (default: 4096)
@@ -31,6 +32,7 @@ class SimCLR(nn.Module):
         self.loss_type = loss_type
         self.m = m
         self.K = K
+        self.radius = 0.5
         
         # build encoders
         self.base_encoder = base_encoder(num_classes=mlp_dim)
@@ -83,19 +85,60 @@ class SimCLR(nn.Module):
         '''
         # gather keys before updating queue
         keys = concat_all_gather(keys)
+        # print(keys.shape)
 
         batch_size = keys.shape[0]
 
         ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+        # print(ptr)
+        # print(batch_size)
+        # assert self.K % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
+        # print(self.queue[:, ptr:ptr + batch_size].shape)
+        # print(keys.T.shape)
+        # print('-'*20)
+        if self.queue[:, ptr:ptr + batch_size].shape[1] < keys.shape[0]:
+            keys, rest_keys = keys[:self.queue[:, ptr:ptr + batch_size].shape[1]], keys[self.queue[:, ptr:ptr + batch_size].shape[1]:]
+            batch_size = keys.shape[0]
+        else:
+            rest_keys = None
+
         self.queue[:, ptr:ptr + batch_size] = keys.T
         ptr = (ptr + batch_size) % self.K  # move pointer
 
         self.queue_ptr[0] = ptr
 
-    def moco_contrast(self, im_q, im_k, index=None, gamma=0.99, distributed=True):
+        if rest_keys is not None:
+            batch_size = rest_keys.shape[0]
+            self.queue[:, ptr:ptr + batch_size] = rest_keys.T
+            ptr = (ptr + batch_size) % self.K  # move pointer
+
+            self.queue_ptr[0] = ptr
+
+
+    def key_selection(self, query, key):
+        selected_key = None
+        avg_dist = 0.0
+        for q in query:
+            
+            for k in key:
+                dist = (q-k).pow(2).sum().sqrt()
+                if dist <= 2 * self.radius:
+                    if selected_key is None:
+                        selected_key = k.unsqueeze(0)
+                    elif k.cpu().numpy() not in selected_key.cpu().numpy():
+                        selected_key = torch.cat((selected_key, k.unsqueeze(0)), 0)
+                avg_dist += dist.item() / key.shape[0]
+            # print('Average distance is ', avg_dist)
+        avg_dist /= q.shape[0]
+        self.radius = avg_dist / 2
+        if selected_key is None:
+            return key
+        return selected_key
+
+
+    def moco_contrast(self, im_1, im_2, index=None, gamma=0.99, local_rank=0, distributed=True):
         """
         Input:
             im_q: a batch of query images
@@ -105,9 +148,11 @@ class SimCLR(nn.Module):
         """
 
         # compute query features
-        q = self.base_encoder(im_q)  # queries: NxC
-        q = nn.functional.normalize(q, dim=1)
-        batch_size = im_q.shape[0]
+        q1 = self.base_encoder(im_1)  # queries: NxC
+        q1 = nn.functional.normalize(q1, dim=1)
+        q2 = self.base_encoder(im_2)  # queries: NxC
+        q2 = nn.functional.normalize(q2, dim=1)
+        batch_size = im_1.shape[0]
 
         # compute key features
         with torch.no_grad():  # no gradient to keys
@@ -116,8 +161,10 @@ class SimCLR(nn.Module):
             # shuffle for making use of BN
             # im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
-            k = self.key_encoder(im_k)  # keys: NxC
-            k = nn.functional.normalize(k, dim=1)
+            k1 = self.key_encoder(im_2)  # keys: NxC
+            k1 = nn.functional.normalize(k1, dim=1)
+            k2 = self.key_encoder(im_1)  # keys: NxC
+            k2 = nn.functional.normalize(k2, dim=1)
 
             # undo shuffle
             # k = self._batch_unshuffle_ddp(k, idx_unshuffle)
@@ -125,30 +172,39 @@ class SimCLR(nn.Module):
         # compute logits
         # Einstein sum is more intuitive
         # positive logits: Nx1
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1) / self.T
+        l_pos_1 = torch.einsum('nc,nc->n', [q1, k1]).unsqueeze(-1) / self.T
+        l_pos_2 = torch.einsum('nc,nc->n', [q2, k2]).unsqueeze(-1) / self.T
         # negative logits: NxK
-        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()]) / self.T
+        l_neg_1 = torch.einsum('nc,ck->nk', [q1, self.queue.clone().detach()]) / self.T
+        l_neg_2 = torch.einsum('nc,ck->nk', [q2, self.queue.clone().detach()]) / self.T
 
         # logits: Nx(1+K)
-        logits = torch.cat([l_pos, l_neg], dim=1)
+        logits_1 = torch.cat([l_pos_1, l_neg_1], dim=1)
+        logits_2 = torch.cat([l_pos_2, l_neg_2], dim=1)
 
         # labels: Nx(1+k) with all-one vectors ath 0th colum and rest of the entries are 0
-        labels = F.one_hot(torch.zeros(batch_size, dtype=torch.long), 1+self.K).to(self.device) 
+        labels = F.one_hot(torch.zeros(batch_size, dtype=torch.long), 1+self.K).to(f'cuda:{local_rank}') 
         neg_masks = 1 - labels
 
-        neg_logits = torch.exp(logits/self.T) * neg_masks
+        neg_logits_1 = torch.exp(logits_1/self.T) * neg_masks
+        neg_logits_2 = torch.exp(logits_2/self.T) * neg_masks
 
-        u = (1 - gamma) * self.u[index].cuda() + gamma * torch.sum(neg_logits, dim=1, keepdim=True)/(2*(batch_size-1))
-        self.u[index] = u.detach().cpu()
+        # u1 = (1 - gamma) * self.u[index].cuda(local_rank, non_blocking=True) + gamma * torch.sum(neg_logits_1, dim=1, keepdim=True)/(2*(batch_size-1))
+        # u2 = (1 - gamma) * self.u[index].cuda(local_rank, non_blocking=True) + gamma * torch.sum(neg_logits_2, dim=1, keepdim=True)/(2*(batch_size-1))
+        u1 = (1 - gamma) * self.u[index].cuda(local_rank, non_blocking=True) + gamma * torch.sum(neg_logits_1, dim=1, keepdim=True)/(self.K)
+        u2 = (1 - gamma) * self.u[index].cuda(local_rank, non_blocking=True) + gamma * torch.sum(neg_logits_2, dim=1, keepdim=True)/(self.K)
+        self.u[index] = u1.detach().cpu()+ u2.detach().cpu()
 
-        p_neg_weights = (neg_logits/u).detach()
+        p_neg_weights1 = (neg_logits_1/u1).detach()
+        p_neg_weights2 = (neg_logits_2/u2).detach()
 
         def softmax_cross_entropy_with_logits(labels, logits, weights):
-            expsum_neg_logits = torch.sum(weights*logits, dim=1, keepdim=True)/(2*(batch_size-1))
+            expsum_neg_logits = torch.sum(weights*logits, dim=1, keepdim=True)/(self.K)
             normalized_logits = logits - expsum_neg_logits
             return -torch.sum(labels * normalized_logits, dim=1)
         
-        loss = softmax_cross_entropy_with_logits(labels, logits, p_neg_weights)
+        loss1 = softmax_cross_entropy_with_logits(labels, logits_1, p_neg_weights1)
+        loss2 = softmax_cross_entropy_with_logits(labels, logits_2, p_neg_weights2)
         
 
         # apply temperature
@@ -158,9 +214,16 @@ class SimCLR(nn.Module):
         # labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
 
         # dequeue and enqueue
-        self._dequeue_and_enqueue(k)
+        # key = torch.cat((self.key_selection(q1, k1), self.key_selection(q2, k2)), 0)
+        # self._dequeue_and_enqueue(key)
+        self._dequeue_and_enqueue(self.key_selection(q1, k1))
+        self._dequeue_and_enqueue(self.key_selection(q2, k2))
+        
+        # self._dequeue_and_enqueue(k1)
+        # self._dequeue_and_enqueue(k2)
 
-        return loss.mean()
+        loss = (loss1 + loss2).mean()
+        return loss
         # return logits, labels
 
     def _build_projector_and_predictor_mlps(self, dim, mlp_dim):
@@ -206,13 +269,13 @@ class SimCLR(nn.Module):
         neg_mask = 1-labels
         logits_ab_aa = torch.cat([logits_ab, logits_aa ], 1) 
         logits_ba_bb = torch.cat([logits_ba, logits_bb ], 1) 
-        print(logits_ab_aa.shape)
+        # print(logits_ab_aa.shape)
       
         neg_logits1 = torch.exp(logits_ab_aa/self.T)*neg_mask   #(B, 2B)
         neg_logits2 = torch.exp(logits_ba_bb/self.T)*neg_mask
         
-        print(torch.sum(neg_logits1, dim=1, keepdim=True).shape)
-        print(self.u[index].shape)
+        # print(torch.sum(neg_logits1, dim=1, keepdim=True).shape)
+        # print(self.u[index].shape)
         u1 = (1 - gamma) * self.u[index].cuda() + gamma * torch.sum(neg_logits1, dim=1, keepdim=True)/(2*(batch_size-1))
         u2 = (1 - gamma) * self.u[index].cuda() + gamma * torch.sum(neg_logits2, dim=1, keepdim=True)/(2*(batch_size-1))
         
@@ -263,36 +326,37 @@ class SimCLR(nn.Module):
         loss = (loss_a + loss_b).mean()
         return loss
     
-    def forward(self, x1, x2, index, gamma):
+    def forward(self, x1, x2, index, gamma, local_rank=0):
         # compute features
-        if self.loss_type == 'moco_cl':
-            loss = self.moco_contrast(x1, x2, index, gamma)
-        else:
-            h1 = self.base_encoder(x1)
-            h2 = self.base_encoder(x2)
+        with amp.autocast():
+            if self.loss_type == 'moco_cl':
+                loss = self.moco_contrast(x1, x2, index, gamma, local_rank)
+            else:
+                h1 = self.base_encoder(x1)
+                h2 = self.base_encoder(x2)
 
-            if self.loss_type == 'dcl':
-                loss = self.dynamic_contrastive_loss(h1, h2, index, gamma) 
-            elif self.loss_type == 'cl':   
-                loss = self.contrastive_loss(h1, h2)
+                if self.loss_type == 'dcl':
+                    loss = self.dynamic_contrastive_loss(h1, h2, index, gamma) 
+                elif self.loss_type == 'cl':   
+                    loss = self.contrastive_loss(h1, h2)
 
         return loss
 
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
-        # gather keys before updating queue
-        keys = concat_all_gather(keys)
+    # @torch.no_grad()
+    # def _dequeue_and_enqueue(self, keys):
+    #     # gather keys before updating queue
+    #     keys = concat_all_gather(keys)
 
-        batch_size = keys.shape[0]
+    #     batch_size = keys.shape[0]
 
-        ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+    #     ptr = int(self.queue_ptr)
+    #     # assert self.K % batch_size == 0  # for simplicity
 
-        # replace the keys at ptr (dequeue and enqueue)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
-        ptr = (ptr + batch_size) % self.K  # move pointer
+    #     # replace the keys at ptr (dequeue and enqueue)
+    #     self.queue[:, ptr:ptr + batch_size] = keys.T
+    #     ptr = (ptr + batch_size) % self.K  # move pointer
 
-        self.queue_ptr[0] = ptr
+    #     self.queue_ptr[0] = ptr
 
 
 class SimCLR_ResNet(SimCLR):
