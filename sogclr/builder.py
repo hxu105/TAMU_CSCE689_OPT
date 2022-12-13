@@ -84,7 +84,7 @@ class SimCLR(nn.Module):
         TODO: retrieval augumentation, how to select negative samples to our queue
         '''
         # gather keys before updating queue
-        keys = concat_all_gather(keys)
+        # keys = concat_all_gather(keys)
         # print(keys.shape)
 
         batch_size = keys.shape[0]
@@ -216,11 +216,11 @@ class SimCLR(nn.Module):
         # dequeue and enqueue
         # key = torch.cat((self.key_selection(q1, k1), self.key_selection(q2, k2)), 0)
         # self._dequeue_and_enqueue(key)
-        self._dequeue_and_enqueue(self.key_selection(q1, k1))
-        self._dequeue_and_enqueue(self.key_selection(q2, k2))
+        #self._dequeue_and_enqueue(self.key_selection(q1, k1))
+        #self._dequeue_and_enqueue(self.key_selection(q2, k2))
         
-        # self._dequeue_and_enqueue(k1)
-        # self._dequeue_and_enqueue(k2)
+        self._dequeue_and_enqueue(k1)
+        self._dequeue_and_enqueue(k2)
 
         loss = (loss1 + loss2).mean()
         return loss

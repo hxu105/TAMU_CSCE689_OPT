@@ -18,6 +18,7 @@ import warnings
 from functools import partial
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+from skimage.util import random_noise
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,7 @@ import torchvision.datasets as datasets
 import torchvision.models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda import amp
+import numpy as np
 
 import sogclr.builder
 import sogclr.loader
@@ -182,7 +184,7 @@ def main():
     main_worker(args.gpu, ngpus_per_node, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, ngpus_per_node, args, local_rank=0):
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -200,10 +202,10 @@ def main_worker(gpu, ngpus_per_node, args):
     # global_rank = int(os.environ['SLURM_PROCID'])
     # loca_rank = os.environ['LOCAL_RANK']
     # world_size = int(os.environ["WORLD_SIZE"])
-    dist.init_process_group(backend='nccl', world_size=int(os.environ["WORLD_SIZE"]))
+    # dist.init_process_group(backend='nccl', world_size=int(os.environ["WORLD_SIZE"]))
 
-    local_rank = torch.distributed.get_rank()
-    torch.cuda.set_device(local_rank)
+    # local_rank = torch.distributed.get_rank()
+    # torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
     # create model
@@ -293,6 +295,7 @@ def main_worker(gpu, ngpus_per_node, args):
         ], p=0.8),
         transforms.RandomGrayscale(p=0.2),
         transforms.RandomHorizontalFlip(),
+        transforms.GaussianBlur(kernel_size=9),
         transforms.ToTensor(),
         normalize,
         # AddGaussianNoise(0, 2/255)
@@ -311,8 +314,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         raise ValueError
 
- 
-    train_sampler = DistributedSampler(train_dataset)
+    #train_sampler = DistributedSampler(train_dataset)
+    train_sampler = None
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=False, sampler=train_sampler, drop_last=True)
@@ -332,7 +336,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         loss = train(train_loader, model, optimizer, scaler, summary_writer, epoch, args, local_rank, scheduler, swa_model, swa_scheduler)
-        if epoch % 10 == 0 or args.epochs - epoch < 3:
+        if epoch % 10 == 0 or args.epochs - epoch < 6:
             if torch.cuda.device_count() > 1:
                 save_checkpoint({
                     'epoch': epoch + 1,
@@ -382,6 +386,14 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args, l
         # adjust learning rate and momentum coefficient per iteration
         lr = adjust_learning_rate(optimizer, epoch + i / iters_per_epoch, args)
         learning_rates.update(lr)
+
+        #print("add noise:0.0009+uniform random")
+        prob = np.random.uniform(0, 1)
+        if prob > 0.5:
+            images[0] = torch.tensor(random_noise(images[0], mode='gaussian', mean=0, var=0.0009, clip=True),
+                                     dtype=torch.float16)
+            images[1] = torch.tensor(random_noise(images[1], mode='gaussian', mean=0, var=0.0009, clip=True),
+                                     dtype=torch.float16)
 
         if args.gpu is not None:
             # images[0] = images[0].to(device)
